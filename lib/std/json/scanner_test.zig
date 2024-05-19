@@ -419,7 +419,7 @@ test "ensureTotalStackCapacity" {
     try testEnsureStackCapacity(true);
 }
 
-fn testDiagnosticsFromSource(expected_error: ?anyerror, line: u64, col: u64, byte_offset: u64, source: anytype) !void {
+fn testDiagnosticsFromSource(expected_error: ?anyerror, line: u64, col: u64, byte_offset: u64, expected_details: ?Diagnostics.ErrorDetails, source: anytype) !void {
     var diagnostics = Diagnostics{};
     source.enableDiagnostics(&diagnostics);
 
@@ -429,41 +429,81 @@ fn testDiagnosticsFromSource(expected_error: ?anyerror, line: u64, col: u64, byt
         try source.skipValue();
         try std.testing.expectEqual(Token.end_of_document, try source.next());
     }
+    if (expected_details) |expected| {
+        try std.testing.expectEqualDeep(expected, diagnostics.last_error_details.?);
+    }
     try std.testing.expectEqual(line, diagnostics.getLine());
     try std.testing.expectEqual(col, diagnostics.getColumn());
     try std.testing.expectEqual(byte_offset, diagnostics.getByteOffset());
 }
-fn testDiagnostics(expected_error: ?anyerror, line: u64, col: u64, byte_offset: u64, s: []const u8) !void {
+fn testDiagnostics(expected_error: ?anyerror, line: u64, col: u64, byte_offset: u64, expected_details: ?Diagnostics.ErrorDetails, s: []const u8) !void {
     var scanner = JsonScanner.initCompleteInput(std.testing.allocator, s);
     defer scanner.deinit();
-    try testDiagnosticsFromSource(expected_error, line, col, byte_offset, &scanner);
+    try testDiagnosticsFromSource(expected_error, line, col, byte_offset, expected_details, &scanner);
 
     var tiny_stream = std.io.fixedBufferStream(s);
     var tiny_json_reader = JsonReader(1, @TypeOf(tiny_stream.reader())).init(std.testing.allocator, tiny_stream.reader());
     defer tiny_json_reader.deinit();
-    try testDiagnosticsFromSource(expected_error, line, col, byte_offset, &tiny_json_reader);
+    try testDiagnosticsFromSource(expected_error, line, col, byte_offset, expected_details, &tiny_json_reader);
 
     var medium_stream = std.io.fixedBufferStream(s);
     var medium_json_reader = JsonReader(5, @TypeOf(medium_stream.reader())).init(std.testing.allocator, medium_stream.reader());
     defer medium_json_reader.deinit();
-    try testDiagnosticsFromSource(expected_error, line, col, byte_offset, &medium_json_reader);
+    try testDiagnosticsFromSource(expected_error, line, col, byte_offset, expected_details, &medium_json_reader);
 }
 test "enableDiagnostics" {
-    try testDiagnostics(error.UnexpectedEndOfInput, 1, 1, 0, "");
-    try testDiagnostics(null, 1, 3, 2, "[]");
-    try testDiagnostics(null, 2, 2, 3, "[\n]");
-    try testDiagnostics(null, 14, 2, example_document_str.len, example_document_str);
+    try testDiagnostics(error.UnexpectedEndOfInput, 1, 1, 0, null, "");
+    try testDiagnostics(null, 1, 3, 2, null, "[]");
+    try testDiagnostics(null, 2, 2, 3, null, "[\n]");
+    try testDiagnostics(null, 14, 2, example_document_str.len, null, example_document_str);
 
-    try testDiagnostics(error.SyntaxError, 3, 1, 25,
+    try testDiagnostics(error.SyntaxError, 3, 1, 25, Diagnostics.ErrorDetails{ .SyntaxError = .{ .got = '}', .expected_chars = "\"" } },
         \\{
         \\  "common": "mistake",
+        \\}
+    );
+
+    try testDiagnostics(error.SyntaxError, 3, 3, 26, Diagnostics.ErrorDetails{ .SyntaxError = .{ .got = '"', .expected_chars = ",}" } },
+        \\{
+        \\  "common": "mistake"
+        \\  "common": "mistake"
+        \\}
+    );
+
+    try testDiagnostics(error.SyntaxError, 2, 3, 4, Diagnostics.ErrorDetails{ .SyntaxError = .{ .got = 'c', .expected_chars = "\"}" } },
+        \\{
+        \\  common: "mistake"
+        \\}
+    );
+
+    try testDiagnostics(error.SyntaxError, 2, 11, 12, Diagnostics.ErrorDetails{ .SyntaxError = .{ .got = '=', .expected_chars = ":" } },
+        \\{
+        \\  "common"= "mistake"
+        \\}
+    );
+
+    try testDiagnostics(error.SyntaxError, 2, 3, 4, Diagnostics.ErrorDetails{ .SyntaxError = .{ .got = '\'', .expected_chars = "\"}" } },
+        \\{
+        \\  'common': "mistake"
+        \\}
+    );
+
+    try testDiagnostics(error.SyntaxError, 3, 1, 24, Diagnostics.ErrorDetails{ .SyntaxError = .{ .got = ']', .expected_chars = "}" } },
+        \\{
+        \\  "common": "mistake"
+        \\]
+    );
+
+    try testDiagnostics(error.SyntaxError, 2, 17, 18, Diagnostics.ErrorDetails{ .SyntaxError = .{ .got = '\n', .expected_chars = "0123456789" } },
+        \\{
+        \\  "mistake": 10.
         \\}
     );
 
     inline for ([_]comptime_int{ 5, 6, 7, 99 }) |reps| {
         // The error happens 1 byte before the end.
         const s = "[" ** reps ++ "}";
-        try testDiagnostics(error.SyntaxError, 1, s.len, s.len - 1, s);
+        try testDiagnostics(error.SyntaxError, 1, s.len, s.len - 1, null, s);
     }
 }
 

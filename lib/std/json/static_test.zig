@@ -15,6 +15,7 @@ const ParseOptions = @import("./static.zig").ParseOptions;
 const JsonScanner = @import("./scanner.zig").Scanner;
 const jsonReader = @import("./scanner.zig").reader;
 const Diagnostics = @import("./scanner.zig").Diagnostics;
+const TokenType = @import("./scanner.zig").TokenType;
 
 const Value = @import("./dynamic.zig").Value;
 
@@ -305,7 +306,13 @@ fn testAllParseFunctions(comptime T: type, expected: T, doc: []const u8) !void {
         var diagnostics = Diagnostics{};
         scanner.enableDiagnostics(&diagnostics);
         var parsed = parseFromTokenSource(T, testing.allocator, &scanner, .{}) catch |e| {
-            std.debug.print("at line,col: {}:{}\n", .{ diagnostics.getLine(), diagnostics.getColumn() });
+            var counter = std.io.countingWriter(std.io.null_writer);
+            try diagnostics.writeLastErrorDetails(counter.writer().any());
+            const buffer = try testing.allocator.alloc(u8, counter.bytes_written);
+            defer testing.allocator.free(buffer);
+            var buffer_writer = std.io.fixedBufferStream(buffer);
+            try diagnostics.writeLastErrorDetails(buffer_writer.writer().any());
+            std.debug.print("at line,col: {}:{}, {s}\n", .{ diagnostics.getLine(), diagnostics.getColumn(), buffer });
             return e;
         };
         defer parsed.deinit();
@@ -924,4 +931,56 @@ test "parse at comptime" {
         break :x res catch unreachable;
     };
     comptime testing.expectEqual(@as(u64, 9999), config.uptime) catch unreachable;
+}
+
+fn testDiagnostics(comptime T: type, expected_error: anyerror, line: u64, col: u64, byte_offset: u64, expected_details: Diagnostics.ErrorDetails, s: []const u8) !void {
+    var scanner = JsonScanner.initCompleteInput(testing.allocator, s);
+    defer scanner.deinit();
+    var diagnostics = Diagnostics{};
+    scanner.enableDiagnostics(&diagnostics);
+
+    try std.testing.expectError(expected_error, parseFromTokenSource(T, testing.allocator, &scanner, .{}));
+    try std.testing.expectEqualDeep(expected_details, diagnostics.last_error_details.?);
+    try std.testing.expectEqual(line, diagnostics.getLine());
+    try std.testing.expectEqual(col, diagnostics.getColumn());
+    try std.testing.expectEqual(byte_offset, diagnostics.getByteOffset());
+}
+test "parse error details" {
+    const simple_target = struct {
+        ifield: i32,
+    };
+
+    try testDiagnostics(simple_target, error.UnexpectedToken, 2, 17, 18, Diagnostics.ErrorDetails{ .UnexpectedToken = .{ .got = .null, .expected_tokens = &[_]TokenType{ .number, .string } } },
+        \\{
+        \\  "ifield": null
+        \\}
+    );
+
+    try testDiagnostics(simple_target, error.DuplicateField, 3, 11, 27, Diagnostics.ErrorDetails{ .DuplicateField = .{ .name = "ifield" } },
+        \\{
+        \\  "ifield": 0,
+        \\  "ifield": 1
+        \\}
+    );
+
+    try testDiagnostics(simple_target, error.UnknownField, 2, 12, 13, Diagnostics.ErrorDetails{ .UnknownField = .{ .name = "mistake" } },
+        \\{
+        \\  "mistake": 1
+        \\}
+    );
+
+    try testDiagnostics(simple_target, error.MissingField, 2, 2, 3, Diagnostics.ErrorDetails{ .MissingField = .{ .name = "ifield" } },
+        \\{
+        \\}
+    );
+
+    const array_target = struct {
+        afield: [4]u8,
+    };
+
+    try testDiagnostics(array_target, error.LengthMismatch, 2, 18, 19, Diagnostics.ErrorDetails{ .LengthMismatch = .{ .got = 3, .expected = 4 } },
+        \\{
+        \\  "afield": "abc"
+        \\}
+    );
 }

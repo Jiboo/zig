@@ -6,9 +6,12 @@ const ArrayList = std.ArrayList;
 
 const Scanner = @import("./scanner.zig").Scanner;
 const Token = @import("./scanner.zig").Token;
+const TokenType = @import("./scanner.zig").TokenType;
 const AllocWhen = @import("./scanner.zig").AllocWhen;
+const ErrorDetails = @import("./scanner.zig").Diagnostics.ErrorDetails;
 const default_max_value_len = @import("./scanner.zig").default_max_value_len;
 const isNumberFormattedLikeAnInteger = @import("./scanner.zig").isNumberFormattedLikeAnInteger;
+const getTokenType = @import("./scanner.zig").getTokenType;
 
 const Value = @import("./dynamic.zig").Value;
 const Array = @import("./dynamic.zig").Array;
@@ -222,7 +225,7 @@ pub fn innerParse(
             defer freeAllocated(allocator, token);
             const slice = switch (token) {
                 inline .number, .allocated_number, .string, .allocated_string => |slice| slice,
-                else => return error.UnexpectedToken,
+                else => return unexpectedToken(source, getTokenType(token), &[_]TokenType{ .number, .string }),
             };
             return try std.fmt.parseFloat(T, slice);
         },
@@ -231,7 +234,7 @@ pub fn innerParse(
             defer freeAllocated(allocator, token);
             const slice = switch (token) {
                 inline .number, .allocated_number, .string, .allocated_string => |slice| slice,
-                else => return error.UnexpectedToken,
+                else => return unexpectedToken(source, getTokenType(token), &[_]TokenType{ .number, .string }),
             };
             return sliceToInt(T, slice);
         },
@@ -255,7 +258,7 @@ pub fn innerParse(
             defer freeAllocated(allocator, token);
             const slice = switch (token) {
                 inline .number, .allocated_number, .string, .allocated_string => |slice| slice,
-                else => return error.UnexpectedToken,
+                else => return unexpectedToken(source, getTokenType(token), &[_]TokenType{ .number, .string }),
             };
             return sliceToEnum(T, slice);
         },
@@ -266,15 +269,13 @@ pub fn innerParse(
 
             if (unionInfo.tag_type == null) @compileError("Unable to parse into untagged union '" ++ @typeName(T) ++ "'");
 
-            if (.object_begin != try source.next()) return error.UnexpectedToken;
+            try expectNextToken(source, &[_]TokenType{.object_begin});
 
             var result: ?T = null;
             var name_token: ?Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
             const field_name = switch (name_token.?) {
                 inline .string, .allocated_string => |slice| slice,
-                else => {
-                    return error.UnexpectedToken;
-                },
+                else => return unexpectedToken(source, getTokenType(name_token.?), &[_]TokenType{.string}),
             };
 
             inline for (unionInfo.fields) |u_field| {
@@ -285,8 +286,8 @@ pub fn innerParse(
                     name_token = null;
                     if (u_field.type == void) {
                         // void isn't really a json type, but we can support void payload union tags with {} as a value.
-                        if (.object_begin != try source.next()) return error.UnexpectedToken;
-                        if (.object_end != try source.next()) return error.UnexpectedToken;
+                        try expectNextToken(source, &[_]TokenType{.object_begin});
+                        try expectNextToken(source, &[_]TokenType{.object_end});
                         result = @unionInit(T, u_field.name, {});
                     } else {
                         // Recurse.
@@ -296,24 +297,24 @@ pub fn innerParse(
                 }
             } else {
                 // Didn't match anything.
-                return error.UnknownField;
+                return unknownField(source, field_name);
             }
 
-            if (.object_end != try source.next()) return error.UnexpectedToken;
+            try expectNextToken(source, &[_]TokenType{.object_end});
 
             return result.?;
         },
 
         .Struct => |structInfo| {
             if (structInfo.is_tuple) {
-                if (.array_begin != try source.next()) return error.UnexpectedToken;
+                try expectNextToken(source, &[_]TokenType{.array_begin});
 
                 var r: T = undefined;
                 inline for (0..structInfo.fields.len) |i| {
                     r[i] = try innerParse(structInfo.fields[i].type, allocator, source, options);
                 }
 
-                if (.array_end != try source.next()) return error.UnexpectedToken;
+                try expectNextToken(source, &[_]TokenType{.array_end});
 
                 return r;
             }
@@ -322,7 +323,7 @@ pub fn innerParse(
                 return T.jsonParse(allocator, source, options);
             }
 
-            if (.object_begin != try source.next()) return error.UnexpectedToken;
+            try expectNextToken(source, &[_]TokenType{.object_begin});
 
             var r: T = undefined;
             var fields_seen = [_]bool{false} ** structInfo.fields.len;
@@ -334,9 +335,7 @@ pub fn innerParse(
                     .object_end => { // No more fields.
                         break;
                     },
-                    else => {
-                        return error.UnexpectedToken;
-                    },
+                    else => return unexpectedToken(source, getTokenType(name_token.?), &[_]TokenType{ .string, .object_end }),
                 };
 
                 inline for (structInfo.fields, 0..) |field, i| {
@@ -354,7 +353,7 @@ pub fn innerParse(
                                     _ = try innerParse(field.type, allocator, source, options);
                                     break;
                                 },
-                                .@"error" => return error.DuplicateField,
+                                .@"error" => return duplicateField(source, field_name),
                                 .use_last => {},
                             }
                         }
@@ -368,11 +367,11 @@ pub fn innerParse(
                     if (options.ignore_unknown_fields) {
                         try source.skipValue();
                     } else {
-                        return error.UnknownField;
+                        return unknownField(source, field_name);
                     }
                 }
             }
-            try fillDefaultStructValues(T, &r, &fields_seen);
+            try fillDefaultStructValues(T, &r, &fields_seen, source);
             return r;
         },
 
@@ -383,7 +382,7 @@ pub fn innerParse(
                     return internalParseArray(T, arrayInfo.child, arrayInfo.len, allocator, source, options);
                 },
                 .string => {
-                    if (arrayInfo.child != u8) return error.UnexpectedToken;
+                    if (arrayInfo.child != u8) return unexpectedToken(source, .string, &[_]TokenType{.array_begin});
                     // Fixed-length string.
 
                     var r: T = undefined;
@@ -391,32 +390,32 @@ pub fn innerParse(
                     while (true) {
                         switch (try source.next()) {
                             .string => |slice| {
-                                if (i + slice.len != r.len) return error.LengthMismatch;
+                                if (i + slice.len != r.len) return lengthMissmatch(source, i + slice.len, r.len);
                                 @memcpy(r[i..][0..slice.len], slice);
                                 break;
                             },
                             .partial_string => |slice| {
-                                if (i + slice.len > r.len) return error.LengthMismatch;
+                                if (i + slice.len > r.len) return lengthMissmatch(source, i + slice.len, r.len);
                                 @memcpy(r[i..][0..slice.len], slice);
                                 i += slice.len;
                             },
                             .partial_string_escaped_1 => |arr| {
-                                if (i + arr.len > r.len) return error.LengthMismatch;
+                                if (i + arr.len > r.len) return lengthMissmatch(source, i + arr.len, r.len);
                                 @memcpy(r[i..][0..arr.len], arr[0..]);
                                 i += arr.len;
                             },
                             .partial_string_escaped_2 => |arr| {
-                                if (i + arr.len > r.len) return error.LengthMismatch;
+                                if (i + arr.len > r.len) return lengthMissmatch(source, i + arr.len, r.len);
                                 @memcpy(r[i..][0..arr.len], arr[0..]);
                                 i += arr.len;
                             },
                             .partial_string_escaped_3 => |arr| {
-                                if (i + arr.len > r.len) return error.LengthMismatch;
+                                if (i + arr.len > r.len) return lengthMissmatch(source, i + arr.len, r.len);
                                 @memcpy(r[i..][0..arr.len], arr[0..]);
                                 i += arr.len;
                             },
                             .partial_string_escaped_4 => |arr| {
-                                if (i + arr.len > r.len) return error.LengthMismatch;
+                                if (i + arr.len > r.len) return lengthMissmatch(source, i + arr.len, r.len);
                                 @memcpy(r[i..][0..arr.len], arr[0..]);
                                 i += arr.len;
                             },
@@ -427,7 +426,7 @@ pub fn innerParse(
                     return r;
                 },
 
-                else => return error.UnexpectedToken,
+                else => return unexpectedToken(source, .string, &[_]TokenType{ .array_begin, .string }),
             }
         },
 
@@ -436,7 +435,7 @@ pub fn innerParse(
                 .array_begin => {
                     return internalParseArray(T, vecInfo.child, vecInfo.len, allocator, source, options);
                 },
-                else => return error.UnexpectedToken,
+                else => return unexpectedToken(source, .string, &[_]TokenType{.array_begin}),
             }
         },
 
@@ -475,7 +474,7 @@ pub fn innerParse(
                             return try arraylist.toOwnedSlice();
                         },
                         .string => {
-                            if (ptrInfo.child != u8) return error.UnexpectedToken;
+                            if (ptrInfo.child != u8) return unexpectedToken(source, .string, &[_]TokenType{.array_begin});
 
                             // Dynamic length string.
                             if (ptrInfo.sentinel) |sentinel_ptr| {
@@ -497,7 +496,7 @@ pub fn innerParse(
                                 }
                             }
                         },
-                        else => return error.UnexpectedToken,
+                        else => return unexpectedToken(source, .string, &[_]TokenType{ .array_begin, .string }),
                     }
                 },
                 else => @compileError("Unable to parse into type '" ++ @typeName(T) ++ "'"),
@@ -524,7 +523,7 @@ fn internalParseArray(
         r[i] = try innerParse(Child, allocator, source, options);
     }
 
-    if (.array_end != try source.next()) return error.UnexpectedToken;
+    try expectNextToken(source, &[_]TokenType{.array_end});
 
     return r;
 }
@@ -661,7 +660,7 @@ pub fn innerParseFromValue(
                     if (!options.ignore_unknown_fields) return error.UnknownField;
                 }
             }
-            try fillDefaultStructValues(T, &r, &fields_seen);
+            try fillDefaultStructValues(T, &r, &fields_seen, null);
             return r;
         },
 
@@ -775,14 +774,14 @@ fn sliceToEnum(comptime T: type, slice: []const u8) !T {
     return std.meta.intToEnum(T, n);
 }
 
-fn fillDefaultStructValues(comptime T: type, r: *T, fields_seen: *[@typeInfo(T).Struct.fields.len]bool) !void {
+fn fillDefaultStructValues(comptime T: type, r: *T, fields_seen: *[@typeInfo(T).Struct.fields.len]bool, source: anytype) !void {
     inline for (@typeInfo(T).Struct.fields, 0..) |field, i| {
         if (!fields_seen[i]) {
             if (field.default_value) |default_ptr| {
                 const default = @as(*align(1) const field.type, @ptrCast(default_ptr)).*;
                 @field(r, field.name) = default;
             } else {
-                return error.MissingField;
+                return if (@TypeOf(source) != @TypeOf(null)) missingField(source, field.name) else error.MissingField;
             }
         }
     }
@@ -795,6 +794,61 @@ fn freeAllocated(allocator: Allocator, token: Token) void {
         },
         else => {},
     }
+}
+
+fn setLastErrorDetails(source: anytype, details: ErrorDetails) void {
+    if (if (@TypeOf(source.*) == Scanner) source.diagnostics else source.scanner.diagnostics) |diag| {
+        diag.last_error_details = details;
+    }
+}
+
+fn unexpectedToken(source: anytype, got: TokenType, expected_tokens: []const TokenType) ParseFromValueError {
+    setLastErrorDetails(source, .{ .UnexpectedToken = .{
+        .got = got,
+        .expected_tokens = expected_tokens,
+    } });
+    return error.UnexpectedToken;
+}
+
+fn expectNextToken(source: anytype, expected_tokens: []const TokenType) ParseError(@TypeOf(source.*))!void {
+    const tok = try source.next();
+    const tok_type = getTokenType(tok);
+    if (std.mem.indexOfScalar(TokenType, expected_tokens, tok_type) == null) {
+        setLastErrorDetails(source, .{ .UnexpectedToken = .{
+            .got = tok_type,
+            .expected_tokens = expected_tokens,
+        } });
+        return error.UnexpectedToken;
+    }
+}
+
+fn unknownField(source: anytype, name: []const u8) ParseFromValueError {
+    setLastErrorDetails(source, .{ .UnknownField = .{
+        .name = name,
+    } });
+    return error.UnknownField;
+}
+
+fn duplicateField(source: anytype, name: []const u8) ParseFromValueError {
+    setLastErrorDetails(source, .{ .DuplicateField = .{
+        .name = name,
+    } });
+    return error.DuplicateField;
+}
+
+fn missingField(source: anytype, name: []const u8) ParseFromValueError {
+    setLastErrorDetails(source, .{ .MissingField = .{
+        .name = name,
+    } });
+    return error.MissingField;
+}
+
+fn lengthMissmatch(source: anytype, got: usize, expected: usize) ParseFromValueError {
+    setLastErrorDetails(source, .{ .LengthMismatch = .{
+        .got = got,
+        .expected = expected,
+    } });
+    return error.LengthMismatch;
 }
 
 test {

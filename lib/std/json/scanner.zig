@@ -188,6 +188,33 @@ pub const TokenType = enum {
     end_of_document,
 };
 
+pub fn getTokenType(tok: Token) TokenType {
+    switch (tok) {
+        .object_begin => return .object_begin,
+        .object_end => return .object_end,
+        .array_begin => return .array_begin,
+        .array_end => return .array_end,
+
+        .true => return .true,
+        .false => return .false,
+        .null => return .null,
+
+        .number => return .number,
+        .partial_number => return .number,
+        .allocated_number => return .number,
+
+        .string => return .string,
+        .partial_string => return .string,
+        .partial_string_escaped_1 => return .string,
+        .partial_string_escaped_2 => return .string,
+        .partial_string_escaped_3 => return .string,
+        .partial_string_escaped_4 => return .string,
+        .allocated_string => return .string,
+
+        .end_of_document => return .end_of_document,
+    }
+}
+
 /// To enable diagnostics, declare `var diagnostics = Diagnostics{};` then call `source.enableDiagnostics(&diagnostics);`
 /// where `source` is either a `std.json.Reader` or a `std.json.Scanner` that has just been initialized.
 /// At any time, notably just after an error, call `getLine()`, `getColumn()`, and/or `getByteOffset()`
@@ -197,6 +224,7 @@ pub const Diagnostics = struct {
     line_start_cursor: usize = @as(usize, @bitCast(@as(isize, -1))), // Start just "before" the input buffer to get a 1-based column for line 1.
     total_bytes_before_current_input: u64 = 0,
     cursor_pointer: *const usize = undefined,
+    last_error_details: ?ErrorDetails = null,
 
     /// Starts at 1.
     pub fn getLine(self: *const @This()) u64 {
@@ -209,6 +237,68 @@ pub const Diagnostics = struct {
     /// Starts at 0. Measures the byte offset since the start of the input.
     pub fn getByteOffset(self: *const @This()) u64 {
         return self.total_bytes_before_current_input + self.cursor_pointer.*;
+    }
+
+    /// These should only be used to generate human-readable errors, don't have any logic relying on these, as they might change unexpectedly
+    pub const ErrorDetails = union(enum) {
+        SyntaxError: struct {
+            got: u8 = 0,
+            expected_chars: []const u8 = &[_]u8{},
+        },
+        UnexpectedToken: struct {
+            got: TokenType,
+            expected_tokens: []const TokenType,
+        },
+        DuplicateField: struct {
+            name: []const u8,
+        },
+        UnknownField: struct {
+            name: []const u8,
+        },
+        MissingField: struct {
+            name: []const u8,
+        },
+        LengthMismatch: struct {
+            got: usize,
+            expected: usize,
+        },
+    };
+
+    pub fn writeLastErrorDetails(self: *const @This(), writer: std.io.AnyWriter) !void {
+        if (self.last_error_details) |details| {
+            switch (details) {
+                .SyntaxError => |syntax_error| {
+                    try writer.print("unexpected character '{c}', expected ", .{syntax_error.got});
+                    for (syntax_error.expected_chars, 0..) |char, index| {
+                        if (index > 0) {
+                            try writer.writeAll(", ");
+                        }
+                        try writer.print("'{c}'", .{char});
+                    }
+                },
+                .UnexpectedToken => |unexpected_token| {
+                    try writer.print("unexpected token {}, expected ", .{unexpected_token.got});
+                    for (unexpected_token.expected_tokens, 0..) |token, index| {
+                        if (index > 0) {
+                            try writer.writeAll(", ");
+                        }
+                        try writer.print("{}", .{token});
+                    }
+                },
+                .DuplicateField => |duplicate_field| {
+                    try writer.print("duplicate field {s}", .{duplicate_field.name});
+                },
+                .UnknownField => |unknown_field| {
+                    try writer.print("unknown field {s}", .{unknown_field.name});
+                },
+                .MissingField => |missing_field| {
+                    try writer.print("missing field {s}", .{missing_field.name});
+                },
+                .LengthMismatch => |length_missmatch| {
+                    try writer.print("unexpected length {}, expected {}", .{ length_missmatch.got, length_missmatch.expected });
+                },
+            }
+        }
     }
 };
 
@@ -743,7 +833,7 @@ pub const Scanner = struct {
                             continue :state_loop;
                         },
 
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "{[\"0123456789-tfn"),
                     }
                 },
 
@@ -759,19 +849,19 @@ pub const Scanner = struct {
                                 self.state = .value;
                                 continue :state_loop;
                             },
-                            else => return error.SyntaxError,
+                            else => return self.syntaxErrorExpectedChars(c, ":"),
                         }
                     }
 
                     switch (c) {
                         '}' => {
-                            if (self.stack.pop() != OBJECT_MODE) return error.SyntaxError;
+                            if (self.stack.pop() != OBJECT_MODE) return self.syntaxErrorExpectedChars(c, "]");
                             self.cursor += 1;
                             // stay in .post_value state.
                             return .object_end;
                         },
                         ']' => {
-                            if (self.stack.pop() != ARRAY_MODE) return error.SyntaxError;
+                            if (self.stack.pop() != ARRAY_MODE) return self.syntaxErrorExpectedChars(c, "}");
                             self.cursor += 1;
                             // stay in .post_value state.
                             return .array_end;
@@ -788,7 +878,7 @@ pub const Scanner = struct {
                             self.cursor += 1;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError,
+                        else => return self.syntaxErrorExpectedChars(c, if (self.stack.peek() == OBJECT_MODE) ",}" else ",]"),
                     }
                 },
 
@@ -807,7 +897,7 @@ pub const Scanner = struct {
                             self.state = .post_value;
                             return .object_end;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "\"}"),
                     }
                 },
                 .object_post_comma => {
@@ -819,7 +909,7 @@ pub const Scanner = struct {
                             self.string_is_object_key = true;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "\""),
                     }
                 },
 
@@ -851,7 +941,7 @@ pub const Scanner = struct {
                             self.state = .number_int;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "0123456789"),
                     }
                 },
                 .number_leading_zero => {
@@ -903,7 +993,7 @@ pub const Scanner = struct {
                             self.state = .number_frac;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "0123456789"),
                     }
                 },
                 .number_frac => {
@@ -936,7 +1026,7 @@ pub const Scanner = struct {
                             self.state = .number_post_e_sign;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "0123456789+-"),
                     }
                 },
                 .number_post_e_sign => {
@@ -947,7 +1037,7 @@ pub const Scanner = struct {
                             self.state = .number_exp;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "0123456789"),
                     }
                 },
                 .number_exp => {
@@ -966,7 +1056,7 @@ pub const Scanner = struct {
                 .string => {
                     while (self.cursor < self.input.len) : (self.cursor += 1) {
                         switch (self.input[self.cursor]) {
-                            0...0x1f => return error.SyntaxError, // Bare ASCII control code in string.
+                            0...0x1f => |c| return self.syntaxErrorUnauthorized(c), // Bare ASCII control code in string.
 
                             // ASCII plain text.
                             0x20...('"' - 1), ('"' + 1)...('\\' - 1), ('\\' + 1)...0x7F => continue,
@@ -1023,7 +1113,7 @@ pub const Scanner = struct {
                                 self.state = .string_utf8_third_to_last_byte_guard_against_too_large;
                                 continue :state_loop;
                             },
-                            0x80...0xC1, 0xF5...0xFF => return error.SyntaxError, // Invalid UTF-8.
+                            0x80...0xC1, 0xF5...0xFF => return self.syntaxErrorInvalidUnicode(), // Invalid UTF-8.
                         }
                     }
                     if (self.is_end_of_input) return error.UnexpectedEndOfInput;
@@ -1076,7 +1166,7 @@ pub const Scanner = struct {
                             self.state = .string_backslash_u;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "\"\\/bfnrtu"),
                     }
                 },
                 .string_backslash_u => {
@@ -1091,7 +1181,7 @@ pub const Scanner = struct {
                         'a'...'f' => {
                             self.utf16_code_units[0] = @as(u16, c - 'a' + 10) << 12;
                         },
-                        else => return error.SyntaxError,
+                        else => return self.syntaxErrorExpectedChars(c, "0123456789abcdefABCDEF"),
                     }
                     self.cursor += 1;
                     self.state = .string_backslash_u_1;
@@ -1109,7 +1199,7 @@ pub const Scanner = struct {
                         'a'...'f' => {
                             self.utf16_code_units[0] |= @as(u16, c - 'a' + 10) << 8;
                         },
-                        else => return error.SyntaxError,
+                        else => return self.syntaxErrorExpectedChars(c, "0123456789abcdefABCDEF"),
                     }
                     self.cursor += 1;
                     self.state = .string_backslash_u_2;
@@ -1127,7 +1217,7 @@ pub const Scanner = struct {
                         'a'...'f' => {
                             self.utf16_code_units[0] |= @as(u16, c - 'a' + 10) << 4;
                         },
-                        else => return error.SyntaxError,
+                        else => return self.syntaxErrorExpectedChars(c, "0123456789abcdefABCDEF"),
                     }
                     self.cursor += 1;
                     self.state = .string_backslash_u_3;
@@ -1145,14 +1235,14 @@ pub const Scanner = struct {
                         'a'...'f' => {
                             self.utf16_code_units[0] |= c - 'a' + 10;
                         },
-                        else => return error.SyntaxError,
+                        else => return self.syntaxErrorExpectedChars(c, "0123456789abcdefABCDEF"),
                     }
                     self.cursor += 1;
                     if (std.unicode.utf16IsHighSurrogate(self.utf16_code_units[0])) {
                         self.state = .string_surrogate_half;
                         continue :state_loop;
                     } else if (std.unicode.utf16IsLowSurrogate(self.utf16_code_units[0])) {
-                        return error.SyntaxError; // Unexpected low surrogate half.
+                        return self.syntaxErrorInvalidUnicode(); // Unexpected low surrogate half.
                     } else {
                         self.value_start = self.cursor;
                         self.state = .string;
@@ -1166,7 +1256,7 @@ pub const Scanner = struct {
                             self.state = .string_surrogate_half_backslash;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError, // Expected low surrogate half.
+                        else => |c| return self.syntaxErrorExpectedChars(c, "\\"), // Expected low surrogate half.
                     }
                 },
                 .string_surrogate_half_backslash => {
@@ -1176,7 +1266,7 @@ pub const Scanner = struct {
                             self.state = .string_surrogate_half_backslash_u;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError, // Expected low surrogate half.
+                        else => |c| return self.syntaxErrorExpectedChars(c, "u"), // Expected low surrogate half.
                     }
                 },
                 .string_surrogate_half_backslash_u => {
@@ -1187,7 +1277,7 @@ pub const Scanner = struct {
                             self.state = .string_surrogate_half_backslash_u_1;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError, // Expected low surrogate half.
+                        else => |c| return self.syntaxErrorExpectedChars(c, "dD"), // Expected low surrogate half.
                     }
                 },
                 .string_surrogate_half_backslash_u_1 => {
@@ -1205,7 +1295,7 @@ pub const Scanner = struct {
                             self.state = .string_surrogate_half_backslash_u_2;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError, // Expected low surrogate half.
+                        else => return self.syntaxErrorExpectedChars(c, "CDEFcdef"), // Expected low surrogate half.
                     }
                 },
                 .string_surrogate_half_backslash_u_2 => {
@@ -1229,7 +1319,7 @@ pub const Scanner = struct {
                             self.state = .string_surrogate_half_backslash_u_3;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError,
+                        else => return self.syntaxErrorExpectedChars(c, "0123456789abcdefABCDEF"),
                     }
                 },
                 .string_surrogate_half_backslash_u_3 => {
@@ -1244,7 +1334,7 @@ pub const Scanner = struct {
                         'a'...'f' => {
                             self.utf16_code_units[1] |= c - 'a' + 10;
                         },
-                        else => return error.SyntaxError,
+                        else => return self.syntaxErrorExpectedChars(c, "0123456789abcdefABCDEF"),
                     }
                     self.cursor += 1;
                     self.value_start = self.cursor;
@@ -1260,7 +1350,7 @@ pub const Scanner = struct {
                             self.state = .string;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError, // Invalid UTF-8.
+                        else => return self.syntaxErrorInvalidUnicode(), // Invalid UTF-8.
                     }
                 },
                 .string_utf8_second_to_last_byte => {
@@ -1270,7 +1360,7 @@ pub const Scanner = struct {
                             self.state = .string_utf8_last_byte;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError, // Invalid UTF-8.
+                        else => return self.syntaxErrorInvalidUnicode(), // Invalid UTF-8.
                     }
                 },
                 .string_utf8_second_to_last_byte_guard_against_overlong => {
@@ -1280,7 +1370,7 @@ pub const Scanner = struct {
                             self.state = .string_utf8_last_byte;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError, // Invalid UTF-8.
+                        else => return self.syntaxErrorInvalidUnicode(), // Invalid UTF-8.
                     }
                 },
                 .string_utf8_second_to_last_byte_guard_against_surrogate_half => {
@@ -1290,7 +1380,7 @@ pub const Scanner = struct {
                             self.state = .string_utf8_last_byte;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError, // Invalid UTF-8.
+                        else => return self.syntaxErrorInvalidUnicode(), // Invalid UTF-8.
                     }
                 },
                 .string_utf8_third_to_last_byte => {
@@ -1300,7 +1390,7 @@ pub const Scanner = struct {
                             self.state = .string_utf8_second_to_last_byte;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError, // Invalid UTF-8.
+                        else => return self.syntaxErrorInvalidUnicode(), // Invalid UTF-8.
                     }
                 },
                 .string_utf8_third_to_last_byte_guard_against_overlong => {
@@ -1310,7 +1400,7 @@ pub const Scanner = struct {
                             self.state = .string_utf8_second_to_last_byte;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError, // Invalid UTF-8.
+                        else => return self.syntaxErrorInvalidUnicode(), // Invalid UTF-8.
                     }
                 },
                 .string_utf8_third_to_last_byte_guard_against_too_large => {
@@ -1320,7 +1410,7 @@ pub const Scanner = struct {
                             self.state = .string_utf8_second_to_last_byte;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError, // Invalid UTF-8.
+                        else => return self.syntaxErrorInvalidUnicode(), // Invalid UTF-8.
                     }
                 },
 
@@ -1331,7 +1421,7 @@ pub const Scanner = struct {
                             self.state = .literal_tr;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "r"),
                     }
                 },
                 .literal_tr => {
@@ -1341,7 +1431,7 @@ pub const Scanner = struct {
                             self.state = .literal_tru;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "u"),
                     }
                 },
                 .literal_tru => {
@@ -1351,7 +1441,7 @@ pub const Scanner = struct {
                             self.state = .post_value;
                             return .true;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "e"),
                     }
                 },
                 .literal_f => {
@@ -1361,7 +1451,7 @@ pub const Scanner = struct {
                             self.state = .literal_fa;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "a"),
                     }
                 },
                 .literal_fa => {
@@ -1371,7 +1461,7 @@ pub const Scanner = struct {
                             self.state = .literal_fal;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "l"),
                     }
                 },
                 .literal_fal => {
@@ -1381,7 +1471,7 @@ pub const Scanner = struct {
                             self.state = .literal_fals;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "s"),
                     }
                 },
                 .literal_fals => {
@@ -1391,7 +1481,7 @@ pub const Scanner = struct {
                             self.state = .post_value;
                             return .false;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "e"),
                     }
                 },
                 .literal_n => {
@@ -1401,7 +1491,7 @@ pub const Scanner = struct {
                             self.state = .literal_nu;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "u"),
                     }
                 },
                 .literal_nu => {
@@ -1411,7 +1501,7 @@ pub const Scanner = struct {
                             self.state = .literal_nul;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "l"),
                     }
                 },
                 .literal_nul => {
@@ -1421,7 +1511,7 @@ pub const Scanner = struct {
                             self.state = .post_value;
                             return .null;
                         },
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "l"),
                     }
                 },
             }
@@ -1444,7 +1534,7 @@ pub const Scanner = struct {
                         't' => return .true,
                         'f' => return .false,
                         'n' => return .null,
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "{[\"0123456789-tfn"),
                     }
                 },
 
@@ -1460,7 +1550,7 @@ pub const Scanner = struct {
                                 self.state = .value;
                                 continue :state_loop;
                             },
-                            else => return error.SyntaxError,
+                            else => return self.syntaxErrorExpectedChars(c, ":"),
                         }
                     }
 
@@ -1479,7 +1569,7 @@ pub const Scanner = struct {
                             self.cursor += 1;
                             continue :state_loop;
                         },
-                        else => return error.SyntaxError,
+                        else => return self.syntaxErrorExpectedChars(c, if (self.stack.peek() == OBJECT_MODE) ",}" else ",]"),
                     }
                 },
 
@@ -1487,13 +1577,13 @@ pub const Scanner = struct {
                     switch (try self.skipWhitespaceExpectByte()) {
                         '"' => return .string,
                         '}' => return .object_end,
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "\"}"),
                     }
                 },
                 .object_post_comma => {
                     switch (try self.skipWhitespaceExpectByte()) {
                         '"' => return .string,
-                        else => return error.SyntaxError,
+                        else => |c| return self.syntaxErrorExpectedChars(c, "\""),
                     }
                 },
 
@@ -1687,6 +1777,32 @@ pub const Scanner = struct {
             4 => return Token{ .partial_string_escaped_4 = buf[0..4].* },
             else => unreachable,
         }
+    }
+
+    fn setLastErrorDetails(self: *@This(), details: Diagnostics.ErrorDetails) void {
+        if (self.diagnostics) |diag| {
+            diag.last_error_details = details;
+        }
+    }
+
+    fn syntaxErrorInvalidUnicode(self: *@This()) Error {
+        self.setLastErrorDetails(.{ .SyntaxError = .{} });
+        return error.SyntaxError;
+    }
+
+    fn syntaxErrorUnauthorized(self: *@This(), got: u8) Error {
+        self.setLastErrorDetails(.{ .SyntaxError = .{
+            .got = got,
+        } });
+        return error.SyntaxError;
+    }
+
+    fn syntaxErrorExpectedChars(self: *@This(), got: u8, expected_chars: []const u8) Error {
+        self.setLastErrorDetails(.{ .SyntaxError = .{
+            .got = got,
+            .expected_chars = expected_chars,
+        } });
+        return error.SyntaxError;
     }
 };
 
